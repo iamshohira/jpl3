@@ -7,6 +7,9 @@ import tempfile
 import subprocess
 import platform
 import shutil
+from pathlib import Path
+import matplotlib.pyplot as plt
+import gc
 
 def figure(num_of_figure=1):
     """
@@ -55,17 +58,22 @@ def figure(num_of_figure=1):
     else:
         return figs
 
-def save(filename):
+def save(filename, cleanup=True):  # 引数 cleanup を追加 (デフォルト True)
     """
     現在のセッションの内容を.jem3ファイルとして保存します。
     
     Parameters
     ----------
-    filename : str
+    filename : str | Path
         保存先のファイル名（例: "output.jem3"）
+    cleanup : bool
+        保存後にセッションとMatplotlibのメモリを開放するかどうか
     """
     session = get_session()
     
+    if isinstance(filename, Path):
+        filename = str(filename)
+
     # --- notebook.json の作成 ---
     cells = []
     
@@ -106,6 +114,21 @@ def save(filename):
                 # zip内パス: clipboard/filename
                 rel_path = os.path.join("clipboard", file)
                 zf.write(abs_path, arcname=rel_path)
+                
+    # print(f"Successfully saved to {filename}")
+
+    # ========================================================
+    # 【追加】クリーンアップ処理
+    # ========================================================
+    if cleanup:
+        # 1. Matplotlibのバックエンドにある全Figureを閉じる
+        plt.close('all')
+        
+        # 2. JPL3のセッション（ログ、一時ディレクトリ）をリセット
+        reset_session()
+        
+        # 3. 強制的にメモリ開放（Pickle化の際のゴミを防ぐ）
+        gc.collect()
                 
     # print(f"Successfully saved to {filename}")
 

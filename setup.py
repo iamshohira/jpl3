@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="jpl3",
-    version="0.1.0",
+    version="0.1.1",
     description="JEMViewer3 Python Library for recording matplotlib commands",
     author="SCE2",
     packages=find_packages(),

@@ -11,3 +11,4 @@ test/test2 copy.py
 test/test2.py
 test/test3.py
 test/test4.py
+test/test5.py
