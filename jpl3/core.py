@@ -8,6 +8,7 @@ import re
 import warnings
 import tempfile
 import sys
+import io
 from functools import wraps
 import numpy as np
 import numpy.ma as ma
@@ -22,32 +23,44 @@ from matplotlib.artist import Artist
 
 class JPLSession:
     """
-    現在のセッション状態（ログ、一時ファイル、カウンタ）を管理するシングルトン
+    現在のセッション状態（ログ、メモリオブジェクト、カウンタ）を管理するシングルトン
     """
     def __init__(self):
-        self.logs = [] 
+        self.logs = []        # 通常の操作ログ（Cell 2用）
+        self.setup_logs = []  # 初期化・構成ログ（Cell 1用）
         self.data_counter = 0
         self.temp_dir = tempfile.mkdtemp(prefix="jpl3_temp_")
         self.clipboard_dir = os.path.join(self.temp_dir, "clipboard")
         os.makedirs(self.clipboard_dir, exist_ok=True)
         self.figures = []
+        
+        # データを一時ファイルではなくメモリ上に保持する辞書
+        self.blobs = {}
 
     def add_log(self, command):
+        """通常の操作ログを追加"""
         self.logs.append(command)
 
-    def get_new_filename(self, ext):
-        filename = f"data_{self.data_counter}{ext}"
-        self.data_counter += 1
-        return filename
+    def add_setup_log(self, command):
+        """初期化・構成用のログを追加"""
+        self.setup_logs.append(command)
 
-    def get_filepath(self, filename):
-        return os.path.join(self.clipboard_dir, filename)
+    def get_new_key(self):
+        """データ識別のためのユニークキーを発行"""
+        key = f"data_{self.data_counter}"
+        self.data_counter += 1
+        return key
+
+    def store_blob(self, key, data):
+        """データをメモリ(blobs)に格納"""
+        self.blobs[key] = data
 
     def cleanup(self):
         try:
             shutil.rmtree(self.temp_dir)
         except Exception as e:
             warnings.warn(f"Failed to cleanup temp dir: {e}")
+        self.blobs.clear()
 
 _session = None
 
@@ -87,15 +100,11 @@ class DecoFigure(Figure):
             self.call_from = "interactive"
         
         # 除外リスト
-        # sca$ : scatterが巻き込まれないよう末尾一致に変更
         self.exclude = re.compile(
             r'get_.*|stale_callback|draw|apply_aspect|ArtistList|set_id|_.*|__.*|clear|clf|sca$'
         )
         
-        # matplotlib.figure.Figure の初期化
         super().__init__(*args, **kwargs)
-        
-        # 自分自身を登録
         self._register_artists_recursive(self, f"figs[{self._fig_id}]")
 
     def _register_artists_recursive(self, obj, header):
@@ -120,14 +129,12 @@ class DecoFigure(Figure):
         if hasattr(obj, '_deco_decorated'):
             return 
 
-        # メンバー取得時のエラーガード
         try:
             members = inspect.getmembers(obj)
         except Exception:
             return
 
         for name, fn in members:
-            # 個別のメソッドデコレート失敗がループ全体を止めないように try-except を内部に配置
             try:
                 if self.exclude.match(name) or not inspect.isroutine(fn):
                     continue
@@ -135,11 +142,9 @@ class DecoFigure(Figure):
                 if hasattr(fn, '_deco_original'):
                     continue 
 
-                # ラッパーの適用
                 setattr(obj, name, self._print_function(name, obj)(fn))
 
             except Exception:
-                # 警告が出すぎるとうるさいので、個別の失敗は黙殺して次へ進む
                 pass
         
         setattr(obj, '_deco_decorated', True)
@@ -161,22 +166,16 @@ class DecoFigure(Figure):
         def wrapper(fn): 
             @wraps(fn)
             def decorate(*args, **kwargs):
-                # --- 関数実行 ---
                 result = fn(*args, **kwargs) 
                 
-                # --- コマンドのロギング判定 ---
                 should_log = False
-                
                 if self.call_from == "interactive":
                     should_log = True
                 else:
                     try:
-                        # 呼び出し元のフレームを取得
                         stack = inspect.stack()
                         caller_frame = stack[1]
                         caller_file = caller_frame.filename
-                        
-                        # 呼び出し元がメインスクリプトと一致する場合のみログする
                         if caller_file and os.path.abspath(caller_file) == self.call_from:
                              should_log = True
                     except Exception:
@@ -187,12 +186,11 @@ class DecoFigure(Figure):
                     if header: 
                         func_name = f"{header}.{name}"
                         command = self._save_emulate_command(func_name, *args, **kwargs)
+                        # ユーザー操作は通常の add_log へ
                         get_session().add_log(command)
                 
-                # --- 新規アーティスト登録 (実行後にスキャン) ---
                 self._scan_and_register_new_artists(obj)
                 
-                # --- 戻り値の登録 ---
                 if result is not None:
                     for item in self._safe_flatten(result):
                         if isinstance(item, Artist):
@@ -229,6 +227,12 @@ class DecoFigure(Figure):
     # Argument Emulation (Serializer)
     # ---------------------------------------------------------
     
+    def _to_csv_bytes(self, obj, **kwargs):
+        """PandasオブジェクトをCSVバイト列(uint8 array)に変換するヘルパー"""
+        buf = io.BytesIO()
+        obj.to_csv(buf, **kwargs)
+        return np.frombuffer(buf.getvalue(), dtype=np.uint8)
+
     def _emulate_args(self, x):
         session = get_session()
         
@@ -238,44 +242,44 @@ class DecoFigure(Figure):
             return header
 
         try:
-            # 2. ファイル保存が必要な型
+            # 2. ファイル保存が必要な型 -> メモリ上のblobsに保存
             if isinstance(x, ma.MaskedArray):
-                d_name = session.get_new_filename(".npy")
-                m_name = session.get_new_filename(".npy")
-                np.save(session.get_filepath(d_name), x.data, allow_pickle=False)
-                np.save(session.get_filepath(m_name), x.mask, allow_pickle=False)
-                return f'np.ma.MaskedArray(data=np.load(clipboard("{d_name}")), mask=np.load(clipboard("{m_name}")))'
+                d_key = session.get_new_key()
+                m_key = session.get_new_key()
+                session.store_blob(d_key, x.data)
+                session.store_blob(m_key, x.mask)
+                return f'np.ma.MaskedArray(data=_load_npy("{d_key}"), mask=_load_npy("{m_key}"))'
 
             if isinstance(x, np.ndarray):
-                fname = session.get_new_filename(".npy")
-                np.save(session.get_filepath(fname), x, allow_pickle=False)
-                return f'np.load(clipboard("{fname}"))'
+                key = session.get_new_key()
+                session.store_blob(key, x)
+                return f'_load_npy("{key}")'
 
             if isinstance(x, pd.Series):
-                fname = session.get_new_filename(".csv")
-                x.to_csv(session.get_filepath(fname), index=True, header=True)
+                key = session.get_new_key()
+                session.store_blob(key, self._to_csv_bytes(x, index=True, header=True))
                 
                 if pd.api.types.is_datetime64_any_dtype(x.dtype):
-                    return f'pd.read_csv(clipboard("{fname}"), index_col=0, header=0, parse_dates=[{x.name!r}]).squeeze("columns")'
+                    return f'_load_csv("{key}", index_col=0, header=0, parse_dates=[{x.name!r}]).squeeze("columns")'
                 elif pd.api.types.is_categorical_dtype(x.dtype):
-                    return f'pd.read_csv(clipboard("{fname}"), index_col=0, header=0).squeeze("columns").astype("category")'
+                    return f'_load_csv("{key}", index_col=0, header=0).squeeze("columns").astype("category")'
                 else:
-                    return f'pd.read_csv(clipboard("{fname}"), index_col=0, header=0).squeeze("columns")'
+                    return f'_load_csv("{key}", index_col=0, header=0).squeeze("columns")'
 
             if isinstance(x, pd.DataFrame):
-                fname = session.get_new_filename(".csv")
-                x.to_csv(session.get_filepath(fname), index=True)
-                return f'pd.read_csv(clipboard("{fname}"), index_col=0)'
+                key = session.get_new_key()
+                session.store_blob(key, self._to_csv_bytes(x, index=True))
+                return f'_load_csv("{key}", index_col=0)'
                 
             if isinstance(x, pd.DatetimeIndex):
-                fname = session.get_new_filename(".csv")
-                pd.Series(x).to_csv(session.get_filepath(fname), index=True, header=False)
-                return f'pd.read_csv(clipboard("{fname}"), index_col=0, header=None, parse_dates=True).index'
+                key = session.get_new_key()
+                session.store_blob(key, self._to_csv_bytes(pd.Series(x), index=True, header=False))
+                return f'_load_csv("{key}", index_col=0, header=None, parse_dates=True).index'
 
             if isinstance(x, (pd.Categorical, pd.CategoricalIndex)):
-                fname = session.get_new_filename(".csv")
-                pd.Series(x).to_csv(session.get_filepath(fname), index=False, header=True)
-                return f'pd.read_csv(clipboard("{fname}"), header=0).squeeze("columns").astype("category")'
+                key = session.get_new_key()
+                session.store_blob(key, self._to_csv_bytes(pd.Series(x), index=False, header=True))
+                return f'_load_csv("{key}", header=0).squeeze("columns").astype("category")'
 
             # 3. 基本型
             typ = type(x)

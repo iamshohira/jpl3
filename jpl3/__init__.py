@@ -7,47 +7,64 @@ import tempfile
 import subprocess
 import platform
 import shutil
+import io
 from pathlib import Path
 import matplotlib.pyplot as plt
+import numpy as np
 import gc
+
+# -----------------------------------------------------
+# Helper Code Injection
+# -----------------------------------------------------
+LOADER_SCRIPT = """
+import pandas as pd
+import datetime
+import numpy as np
+import io
+
+# Load the single data archive
+try:
+    # clipboard() is expected to return the path to the extracted file provided by JEMViewer3
+    _archive_path = clipboard("data.npz")
+    _archive = np.load(_archive_path)
+except Exception as e:
+    print(f"Warning: Could not load data.npz: {e}")
+    _archive = {}
+
+def _load_npy(key):
+    return _archive[key]
+
+def _load_csv(key, **kwargs):
+    # Extract bytes from uint8 array and read as CSV
+    bytes_data = _archive[key].tobytes()
+    return pd.read_csv(io.BytesIO(bytes_data), **kwargs)
+"""
 
 def figure(num_of_figure=1):
     """
     JEM3出力用のFigureオブジェクトを作成します。
-    
-    Parameters
-    ----------
-    num_of_figure : int
-        作成するFigureの数。
-    
-    Returns
-    -------
-    DecoFigure | List[DecoFigure]
-        作成されたFigureオブジェクト。
     """
-    # セッションをリセット（以前のログや一時ファイルをクリア）
     reset_session()
     session = get_session()
     
-    # 必須ライブラリのインポート文をログの冒頭に追加
-    session.add_log("import pandas as pd")
-    session.add_log("import datetime")
+    # --- Cell 1: Setup Phase ---
+    # add_figure() などの環境構築コマンドは setup_logs に記録する
     
     figs = []
     
-    # JEM3用の初期化コマンドをログに追加
-    # Figure 0 はデフォルトで存在するため、clear()のみ
+    # Figure 0 はデフォルトで存在するため、セットアップログへの追加は不要
+    # figs[0].clear() は「操作」の一部として通常のログ(Cell 2)へ記録する
     session.add_log("figs[0].clear()")
     
-    # 最初のFigureを作成・登録
     fig0 = DecoFigure(fig_id=0)
     figs.append(fig0)
     
-    # 2つ目以降のFigureを作成
+    # 2つ目以降のFigureを追加
     for i in range(1, num_of_figure):
-        # JEM3上でFigureを追加するコマンド
-        session.add_log("add_figure()")
-        # 追加されたFigureもデフォルトでsubplotがあるためclear()
+        # 環境構築: Figureの追加は Cell 1 (Setup)
+        session.add_setup_log("add_figure()")
+        
+        # 操作: 初期化(clear)は Cell 2 (Operations)
         session.add_log(f"figs[{i}].clear()")
         
         fig = DecoFigure(fig_id=i)
@@ -58,33 +75,44 @@ def figure(num_of_figure=1):
     else:
         return figs
 
-def save(filename, cleanup=True):  # 引数 cleanup を追加 (デフォルト True)
+def save(filename, cleanup=True):
     """
     現在のセッションの内容を.jem3ファイルとして保存します。
-    
-    Parameters
-    ----------
-    filename : str | Path
-        保存先のファイル名（例: "output.jem3"）
-    cleanup : bool
-        保存後にセッションとMatplotlibのメモリを開放するかどうか
     """
     session = get_session()
     
     if isinstance(filename, Path):
         filename = str(filename)
 
-    # --- notebook.json の作成 ---
-    cells = []
+    # --- 1. data.npz の作成 (メモリ上のblobをファイルに書き出し) ---
+    npz_filename = "data.npz"
+    npz_path = os.path.join(session.clipboard_dir, npz_filename)
     
-    # 蓄積されたログをcellsに変換
-    for log_line in session.logs:
-        cell = {
-            "code": log_line,
-            "description": "from jpl3",
+    if session.blobs:
+        np.savez_compressed(npz_path, **session.blobs)
+    else:
+        np.savez_compressed(npz_path)
+
+    # --- 2. notebook.json の作成 (2セル構成) ---
+    
+    # Cell 1: ヘルパー関数定義 + 初期セットアップ(add_figure)
+    setup_code = LOADER_SCRIPT + "\n" + "\n".join(session.setup_logs)
+    
+    # Cell 2: 実際のプロット操作(clearを含む)
+    main_code = "\n".join(session.logs)
+    
+    cells = [
+        {
+            "code": setup_code,
+            "description": "JPL3 Setup & Initialization",
+            "expanded": False
+        },
+        {
+            "code": main_code,
+            "description": "JPL3 Generated Operations",
             "expanded": True
         }
-        cells.append(cell)
+    ]
         
     notebook_data = {
         "version": "3.0",
@@ -93,64 +121,40 @@ def save(filename, cleanup=True):  # 引数 cleanup を追加 (デフォルト T
         "addons": []
     }
     
-    # notebook.json を一時ディレクトリに保存
     notebook_path = os.path.join(session.temp_dir, "notebook.json")
     with open(notebook_path, 'w', encoding='utf-8') as f:
         json.dump(notebook_data, f, indent=4)
         
-    # --- zipファイルの作成 ---
-    # filenameが .jem3 で終わっていない場合は補完
+    # --- 3. zipファイルの作成 ---
     if not filename.endswith(".jem3"):
         filename += ".jem3"
         
     with zipfile.ZipFile(filename, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
-        # 1. notebook.json をルートに追加
         zf.write(notebook_path, arcname="notebook.json")
-        
-        # 2. clipboardディレクトリの中身を追加
-        for root, _, files in os.walk(session.clipboard_dir):
-            for file in files:
-                abs_path = os.path.join(root, file)
-                # zip内パス: clipboard/filename
-                rel_path = os.path.join("clipboard", file)
-                zf.write(abs_path, arcname=rel_path)
+        if os.path.exists(npz_path):
+            zf.write(npz_path, arcname=f"clipboard/{npz_filename}")
                 
-    # print(f"Successfully saved to {filename}")
-
-    # ========================================================
-    # 【追加】クリーンアップ処理
-    # ========================================================
+    # --- 4. クリーンアップ ---
     if cleanup:
-        # 1. Matplotlibのバックエンドにある全Figureを閉じる
         plt.close('all')
-        
-        # 2. JPL3のセッション（ログ、一時ディレクトリ）をリセット
         reset_session()
-        
-        # 3. 強制的にメモリ開放（Pickle化の際のゴミを防ぐ）
         gc.collect()
-                
-    # print(f"Successfully saved to {filename}")
 
 def show():
     """
     現在作成中のFigureを一時ファイルに保存し、JEMViewer3アプリを起動して表示します。
     """
-    # 1. 一時ファイルの作成 (.jem3)
     fd, temp_path = tempfile.mkstemp(suffix=".jem3", prefix="jpl3_preview_")
     os.close(fd)
     
     try:
-        # 現在の状態を一時ファイルに保存
         save(temp_path)
         
-        # 2. OS判定とアプリパスの探索
         current_os = platform.system()
         app_path = None
         cmd = []
 
-        if current_os == "Darwin":  # macOS
-            # macOS標準のアプリケーションフォルダ、またはユーザーフォルダを探す
+        if current_os == "Darwin":
             candidates = [
                 "/Applications/JEMViewer3.app",
                 os.path.expanduser("~/Applications/JEMViewer3.app")
@@ -159,37 +163,29 @@ def show():
                 if os.path.exists(p):
                     app_path = p
                     break
-            
             if app_path:
-                # macOSでは 'open -a AppPath FilePath' コマンドを使用するのが一般的で安全
                 cmd = ["open", "-a", app_path, temp_path]
             else:
-                raise FileNotFoundError("JEMViewer3.app not found in /Applications or ~/Applications")
+                raise FileNotFoundError("JEMViewer3.app not found")
 
-        elif current_os == "Windows": # Windows
-            # Briefcase (MSI) のインストール先候補
+        elif current_os == "Windows":
             candidates = [
                 r"C:\Program Files\JEMViewer3\JEMViewer3.exe",
                 r"C:\Program Files (x86)\JEMViewer3\JEMViewer3.exe",
                 os.path.expandvars(r"%LOCALAPPDATA%\JEMViewer3\JEMViewer3.exe")
             ]
-            
             for p in candidates:
                 if os.path.exists(p):
                     app_path = p
                     break
-            
             if app_path:
                 cmd = [app_path, temp_path]
             else:
-                raise FileNotFoundError(
-                    "JEMViewer3.exe not found. Please check if it is installed in 'Program Files' or 'AppData'."
-                )
+                raise FileNotFoundError("JEMViewer3.exe not found")
 
         else:
             raise OSError(f"Unsupported operating system: {current_os}")
 
-        # 3. アプリケーションの起動
         print(f"Launching JEMViewer3 from: {app_path}")
         subprocess.Popen(cmd)
 
