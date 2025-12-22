@@ -21,6 +21,7 @@ import pandas as pd
 import datetime
 import numpy as np
 import io
+from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
 
 # Load the single data archive
 try:
