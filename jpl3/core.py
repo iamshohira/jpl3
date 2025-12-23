@@ -23,7 +23,8 @@ from matplotlib.artist import Artist
 
 class JPLSession:
     """
-    現在のセッション状態（ログ、メモリオブジェクト、カウンタ）を管理するシングルトン
+    1つのプロジェクト（セッション）の状態を管理するクラス。
+    ログ、バイナリデータ、一時ディレクトリを保持する。
     """
     def __init__(self):
         self.logs = []        # 通常の操作ログ（Cell 2用）
@@ -32,7 +33,7 @@ class JPLSession:
         self.temp_dir = tempfile.mkdtemp(prefix="jpl3_temp_")
         self.clipboard_dir = os.path.join(self.temp_dir, "clipboard")
         os.makedirs(self.clipboard_dir, exist_ok=True)
-        self.figures = []
+        self.figures = []     # このセッションに紐づくFigureリスト
         
         # データを一時ファイルではなくメモリ上に保持する辞書
         self.blobs = {}
@@ -61,27 +62,19 @@ class JPLSession:
         except Exception as e:
             warnings.warn(f"Failed to cleanup temp dir: {e}")
         self.blobs.clear()
-
-_session = None
-
-def get_session():
-    global _session
-    if _session is None:
-        _session = JPLSession()
-    return _session
-
-def reset_session():
-    global _session
-    if _session:
-        _session.cleanup()
-    _session = JPLSession()
+        self.figures.clear()
 
 # -----------------------------------------------------
 # DecoFigure Class
 # -----------------------------------------------------
 
 class DecoFigure(Figure):
-    def __init__(self, fig_id, *args, **kwargs):
+    def __init__(self, session, fig_id, *args, **kwargs):
+        """
+        session: このFigureが所属するJPLSessionインスタンス
+        fig_id: セッション内でのFigure ID (0, 1, 2...)
+        """
+        self.session = session  # セッションをインスタンス変数として保持
         self._fig_id = fig_id
         self.artist_map = {}
         # 追跡対象のリスト
@@ -185,9 +178,9 @@ class DecoFigure(Figure):
                     header = self._header(obj)
                     if header: 
                         func_name = f"{header}.{name}"
+                        # self.session を使用してログを記録
                         command = self._save_emulate_command(func_name, *args, **kwargs)
-                        # ユーザー操作は通常の add_log へ
-                        get_session().add_log(command)
+                        self.session.add_log(command)
                 
                 self._scan_and_register_new_artists(obj)
                 
@@ -228,13 +221,13 @@ class DecoFigure(Figure):
     # ---------------------------------------------------------
     
     def _to_csv_bytes(self, obj, **kwargs):
-        """PandasオブジェクトをCSVバイト列(uint8 array)に変換するヘルパー"""
         buf = io.BytesIO()
         obj.to_csv(buf, **kwargs)
         return np.frombuffer(buf.getvalue(), dtype=np.uint8)
 
     def _emulate_args(self, x):
-        session = get_session()
+        # self.session を使用
+        session = self.session
         
         # 1. 登録済みアーティスト
         header = self._header(x)
